@@ -25,6 +25,16 @@ Unknown signal (square wave into LCR trap), wrong channel enabled, invalid timeb
 | MSO1074Z | 4 analog + 16 digital | |
 | MSO1104Z | 4 analog + 16 digital | |
 
+**Rigol DS1000Z-E series (8-bit):**
+
+| Model | Channels | Notes |
+|---|---|---|
+| DS1202Z-E | 2 analog | 200 MHz; channel limits covered by offline tests, hardware validation pending |
+| DS1102Z-E | 2 analog | 100 MHz; channel limits covered by offline tests, hardware validation pending |
+
+Channel queries and validation use the model reported by `*IDN?`. This channel
+compatibility change does not establish waveform framing or RAW-memory support on Z-E.
+
 **Rigol DHO series (12-bit):**
 
 | Model | Channels | Notes |
@@ -94,7 +104,15 @@ RIGOL_IP=192.168.1.123
 | `RIGOL_USB` | (unset) | Set to `1` to connect over USB instead of LAN. The first Rigol USB scope is found automatically. |
 | `RIGOL_USB_SERIAL` | (unset) | When several Rigol scopes are on USB, pin a specific one by serial number. |
 | `RIGOL_ENABLE_SEND_RAW` | (unset) | Set to `1` to enable the `send_raw` tool (arbitrary SCPI). Off by default — see [Tools](#tools). |
+| `RIGOL_MODEL` | (unset) | Optional startup tool-schema hint: `DS1202Z-E` or `DS1102Z-E`. Advertises only CHAN1/CHAN2 before connecting. Actual `*IDN?` always determines runtime channel limits. |
 | `RIGOL_SCREENSHOT_DIR` | `screenshots/` | Directory for saved PNG screenshots |
+
+For a DS1202Z-E, set `RIGOL_MODEL=DS1202Z-E` in the environment or `.env` and call
+`idn` at the start of the session. Tool listing performs no instrument I/O. Without
+a model hint, the initial listing retains CHAN1–CHAN4 for existing clients; after
+identification it uses the detected channel count and `idn` sends a tool-list change
+notification. Runtime validation rejects nonexistent channels even if a client keeps
+an old schema. EXT and AC are trigger sources, not downloadable analog channels.
 
 ### USB connection
 

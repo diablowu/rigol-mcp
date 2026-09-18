@@ -10,6 +10,10 @@ import time
 
 import pyvisa
 
+from rigol_mcp.capabilities import (
+    ScopeCapabilities, capabilities_for_idn, capabilities_for_model,
+)
+
 from rigol_mcp.drivers import (
     ScopeDriver,
     driver_for,
@@ -61,6 +65,7 @@ _SLOW_OP_TIMEOUT_MS = 30_000
 _rm: pyvisa.ResourceManager | None = None
 _scope: pyvisa.resources.Resource | None = None
 _driver: ScopeDriver | None = None
+_capabilities: ScopeCapabilities | None = None
 
 
 def _usb_preferred() -> bool:
@@ -228,7 +233,7 @@ def get_scope() -> pyvisa.resources.Resource:
 
 def invalidate_scope() -> None:
     """Close and discard the cached connection so the next call reconnects."""
-    global _scope, _driver
+    global _scope, _driver, _capabilities
     if _scope is not None:
         try:
             _scope.clear()
@@ -240,6 +245,7 @@ def invalidate_scope() -> None:
             pass
         _scope = None
     _driver = None
+    _capabilities = None
 
 
 def get_driver(scope: pyvisa.resources.Resource) -> ScopeDriver:
@@ -247,10 +253,31 @@ def get_driver(scope: pyvisa.resources.Resource) -> ScopeDriver:
 
     Detected once from ``*IDN?`` and cached until :func:`invalidate_scope`.
     """
-    global _driver
+    global _driver, _capabilities
     if _driver is None:
-        _driver = driver_for(scope.query("*IDN?"))
+        identity = scope.query("*IDN?")
+        driver = driver_for(identity)
+        capabilities = capabilities_for_idn(identity)
+        _driver, _capabilities = driver, capabilities
     return _driver
+
+
+def get_capabilities(scope: pyvisa.resources.Resource) -> ScopeCapabilities:
+    """Identify once per session, then use the model's channel limits."""
+    get_driver(scope)
+    if _capabilities is None:
+        raise RuntimeError("Instrument channel capabilities have not been identified")
+    return _capabilities
+
+
+def advertised_capabilities() -> ScopeCapabilities:
+    """Tool listing performs no I/O; use identity or an optional startup model hint."""
+    if _capabilities is not None:
+        return _capabilities
+    model = os.environ.get("RIGOL_MODEL", "").strip().upper()
+    if model and model not in {"DS1202Z-E", "DS1102Z-E"}:
+        raise ValueError("RIGOL_MODEL must be DS1202Z-E or DS1102Z-E, or unset")
+    return capabilities_for_model(model or "unidentified scope")
 
 
 def set_driver_from_idn(idn_str: str) -> ScopeDriver | None:
@@ -260,13 +287,17 @@ def set_driver_from_idn(idn_str: str) -> ScopeDriver | None:
     they've just queried ``*IDN?`` themselves (the ``idn`` tool, for example).
     Returns the selected driver, or None if no driver matched.
     """
-    global _driver
+    global _driver, _capabilities
     try:
-        _driver = driver_for(idn_str)
-    except RuntimeError:
+        driver = driver_for(idn_str)
+        capabilities = capabilities_for_idn(idn_str)
+    except (RuntimeError, ValueError):
         # No driver matched — leave _driver as None so a later dialect call surfaces
         # the same error against a concrete tool invocation.
+        _driver = None
+        _capabilities = None
         return None
+    _driver, _capabilities = driver, capabilities
     return _driver
 
 
@@ -457,7 +488,7 @@ MEASURE_ITEMS_TWO_SOURCE = ALL_TWO_SOURCE_ITEMS
 
 def measure(scope: pyvisa.resources.Resource, channel: str, item: str) -> str:
     """Query a single-source built-in measurement. Returns the raw value string."""
-    ch = channel.upper()
+    ch = get_capabilities(scope).validate_channel(channel)
     it = item.upper()
     if it in MEASURE_ITEMS_TWO_SOURCE:
         raise ValueError(f"'{item}' requires two sources — use measure_between()")
@@ -488,8 +519,9 @@ def measure_between(
     """
     driver = get_driver(scope)
     it = driver.resolve_two_source_item(item)
-    s1 = source1.upper()
-    s2 = source2.upper()
+    capabilities = get_capabilities(scope)
+    s1 = capabilities.validate_channel(source1)
+    s2 = capabilities.validate_channel(source2)
     notes = [n for src in (s1, s2) if (n := ensure_channel_displayed(scope, src))]
     driver.register_measure_item(scope, it, s1, s2)
     value = annotate_measurement_value(scope.query(f":MEASure:ITEM? {it},{s1},{s2}").strip())
@@ -514,12 +546,9 @@ def ensure_channel_displayed(scope: pyvisa.resources.Resource, channel: str) -> 
     return the 9.9E37 invalid sentinel.
 
     Returns a note string when the channel had to be enabled (for surfacing in the
-    tool result), None if it was already on. Non-CHAN sources (MATH, digital) use
-    different display SCPI, so they are left untouched.
+    tool result), None if it was already on. Only validated analog channels are accepted.
     """
-    ch = channel.upper()
-    if not ch.startswith("CHAN"):
-        return None
+    ch = get_capabilities(scope).validate_channel(channel)
     if scope.query(f":{ch}:DISP?").strip() not in ("0", "OFF"):
         return None
     scope.write(f":{ch}:DISP ON")
@@ -552,36 +581,50 @@ def get_scope_state(scope: pyvisa.resources.Resource) -> dict:
     """Return a snapshot of the scope's current configuration."""
     state: dict = {}
 
-    state["timebase"] = {
+    state["timebase"] = get_timebase_state(scope)
+    state["channels"] = {
+        ch: get_channel_state(scope, ch) for ch in get_capabilities(scope).channels
+    }
+    state["trigger"] = get_trigger_state(scope)
+    return state
+
+
+def get_timebase_state(scope: pyvisa.resources.Resource) -> dict:
+    """Read only the horizontal configuration."""
+    return {
         "scale_s_div": scope.query(":TIM:SCAL?").strip(),
         "offset_s":    scope.query(":TIM:OFFS?").strip(),
         "mode":        scope.query(":TIM:MODE?").strip(),
     }
 
-    state["channels"] = {}
-    for i in range(1, 5):
-        ch = f"CHAN{i}"
-        state["channels"][ch] = {
-            "display":    scope.query(f":{ch}:DISP?").strip(),
-            "scale_v_div": scope.query(f":{ch}:SCAL?").strip(),
-            "offset_v":   scope.query(f":{ch}:OFFS?").strip(),
-            "coupling":   scope.query(f":{ch}:COUP?").strip(),
-            "probe":      scope.query(f":{ch}:PROB?").strip(),
-        }
 
+def get_channel_state(scope: pyvisa.resources.Resource, channel: str) -> dict:
+    """Read one validated analog channel without querying unrelated channels."""
+    ch = get_capabilities(scope).validate_channel(channel)
+    return {
+        "display":    scope.query(f":{ch}:DISP?").strip(),
+        "scale_v_div": scope.query(f":{ch}:SCAL?").strip(),
+        "offset_v":   scope.query(f":{ch}:OFFS?").strip(),
+        "coupling":   scope.query(f":{ch}:COUP?").strip(),
+        "probe":      scope.query(f":{ch}:PROB?").strip(),
+    }
+
+
+def get_trigger_state(scope: pyvisa.resources.Resource) -> dict:
+    """Read only the trigger configuration."""
     trig_mode = scope.query(":TRIGger:MODE?").strip()
-    state["trigger"] = {
+    trigger = {
         "mode":   trig_mode,
         "status": scope.query(":TRIGger:STATus?").strip(),
     }
     if trig_mode.upper() in ("EDGE", "EDGMODE"):
-        state["trigger"].update({
+        trigger.update({
             "source":  scope.query(":TRIGger:EDGE:SOURce?").strip(),
             "slope":   scope.query(":TRIGger:EDGE:SLOPe?").strip(),
             "level_v": scope.query(":TRIGger:EDGE:LEVel?").strip(),
         })
 
-    return state
+    return trigger
 
 
 def set_channel(
@@ -600,7 +643,7 @@ def set_channel(
     both DS1000Z and DHO — writing SCAL first would cause a subsequent
     PROB change to multiply it and land at the wrong V/div.
     """
-    ch = channel.upper()
+    ch = get_capabilities(scope).validate_channel(channel)
     if display is not None:
         scope.write(f":{ch}:DISP {'ON' if display else 'OFF'}")
     if probe is not None:
@@ -638,6 +681,14 @@ def set_trigger(
     level: float | None = None,
 ) -> None:
     """Configure edge trigger. source: CHAN1–CHAN4, EXT. slope: POS, NEG, RFAL."""
+    capabilities = get_capabilities(scope)
+    if source is not None:
+        source = source.upper()
+        if source not in capabilities.trigger_sources:
+            raise ValueError(
+                f"Invalid trigger source {source!r} for {capabilities.model}. "
+                f"Valid: {capabilities.trigger_sources}"
+            )
     scope.write(":TRIGger:MODE EDGE")
     if source is not None:
         scope.write(f":TRIGger:EDGE:SOURce {source.upper()}")
@@ -655,7 +706,7 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
     Returns time/voltage arrays plus summary statistics.
     Stop or single-trigger the scope first for consistent data.
     """
-    ch = channel.upper()
+    ch = get_capabilities(scope).validate_channel(channel)
     warnings = []
     if note := ensure_channel_displayed(scope, ch):
         warnings.append(note)

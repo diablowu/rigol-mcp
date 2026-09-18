@@ -111,14 +111,16 @@ def clean_env_and_cache(monkeypatch):
     """Isolate every test: clear RIGOL_* env (incl. anything loaded from .env) and reset
     the module-level cached connection / backend hint in rigol_mcp.scope."""
     for var in ("RIGOL_IP", "RIGOL_USB", "RIGOL_USB_SERIAL", "RIGOL_SCREENSHOT_DIR",
-                "RIGOL_ENABLE_SEND_RAW"):
+                "RIGOL_ENABLE_SEND_RAW", "RIGOL_MODEL"):
         monkeypatch.delenv(var, raising=False)
     scope_mod._rm = None
     scope_mod._scope = None
     scope_mod._usb_backend_hint = None
     scope_mod._driver = None
+    scope_mod._capabilities = None
     yield
     scope_mod._rm = None
     scope_mod._scope = None
     scope_mod._usb_backend_hint = None
     scope_mod._driver = None
+    scope_mod._capabilities = None
