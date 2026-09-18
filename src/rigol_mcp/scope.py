@@ -712,28 +712,31 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
         warnings.append(note)
     scope.write(f":WAV:SOUR {ch}")
     scope.write(":WAV:MODE NORM")
-    scope.write(":WAV:FORM ASC")
-    get_driver(scope).prepare_waveform(scope)
+    driver = get_driver(scope)
+    scope.write(f":WAV:FORM {driver.waveform_format}")
+    driver.prepare_waveform(scope)
 
     pre_str = scope.query(":WAV:PRE?").strip()
     pre = pre_str.split(",")
-    x_inc   = float(pre[4])
-    x_origin = float(pre[5])
-    x_ref   = float(pre[6])
 
-    # Read the ASCII waveform payload. The framing differs by family (DS1000Z wraps the CSV
-    # in an IEEE 488.2 definite-length block, DHO sends bare CSV) so the read strategy is
-    # delegated to the driver — see ScopeDriver.read_waveform_data.
-    data_str = get_driver(scope).read_waveform_data(scope)
-    voltages = [float(v) for v in data_str.split(",") if v.strip()]
+    # Driver selects both the framing and sample format: legacy families use voltage CSV,
+    # DS1000Z-E returns calibrated BYTE samples. Do not treat binary LF as a terminator.
+    payload = driver.read_waveform_data(scope)
+
+    def has_samples(data: str | bytes) -> bool:
+        if isinstance(data, bytes):
+            return bool(data)
+        return any(value.strip() for value in data.split(","))
+
     # A just-enabled channel serves an empty payload until a full sweep lands (~2 s after
     # DISP ON at 50 ms/div on a DS1104Z), so poll briefly before giving up.
     deadline = time.monotonic() + _WAVEFORM_DATA_RETRY_S
-    while not voltages and time.monotonic() < deadline:
+    polled = False
+    while not has_samples(payload) and time.monotonic() < deadline:
         time.sleep(1.0)
-        data_str = get_driver(scope).read_waveform_data(scope)
-        voltages = [float(v) for v in data_str.split(",") if v.strip()]
-    if not voltages:
+        payload = driver.read_waveform_data(scope)
+        polled = True
+    if not has_samples(payload):
         reason = (
             f"{ch} returned no waveform data — the channel has not acquired anything yet. "
             "Ensure acquisition is running (run tool, or single/autoscale) and re-capture."
@@ -741,13 +744,15 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
         if warnings:
             reason += f" Note: {warnings[0]}"
         raise RuntimeError(reason)
-    if x_inc == 0:
+    if polled or (len(pre) > 4 and float(pre[4]) == 0):
         # The preamble was read before the first sweep on a just-enabled channel completed —
         # the scope reports 0 s/point until then. Refresh it now that data exists.
         pre = scope.query(":WAV:PRE?").strip().split(",")
-        x_inc    = float(pre[4])
-        x_origin = float(pre[5])
-        x_ref    = float(pre[6])
+    # Decode after refreshing: initial zero increments can include stale Y calibration too.
+    voltages = driver.decode_waveform_data(payload, pre)
+    x_inc    = float(pre[4])
+    x_origin = float(pre[5])
+    x_ref    = float(pre[6])
     n = len(voltages)
     times = [x_origin + (i - x_ref) * x_inc for i in range(n)]
 
@@ -848,6 +853,11 @@ def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
     n = int(prefix[1:2])
     data_length = int(scope.read_bytes(n))
     raw = scope.read_bytes(data_length + 1)  # +1 for the trailing newline
+    if len(raw) != data_length + 1:
+        raise ValueError(
+            f"Truncated block: header declared {data_length} payload bytes plus newline, "
+            f"received {len(raw)} bytes"
+        )
     if raw[-1:] != b'\n':
         raise ValueError(f"Expected \\n after definite-length block, got {raw[-1:]!r}")
     return raw[:-1]

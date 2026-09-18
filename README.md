@@ -32,8 +32,10 @@ Unknown signal (square wave into LCR trap), wrong channel enabled, invalid timeb
 | DS1202Z-E | 2 analog | 200 MHz; channel limits covered by offline tests, hardware validation pending |
 | DS1102Z-E | 2 analog | 100 MHz; channel limits covered by offline tests, hardware validation pending |
 
-Channel queries and validation use the model reported by `*IDN?`. This channel
-compatibility change does not establish waveform framing or RAW-memory support on Z-E.
+Channel queries and validation use the model reported by `*IDN?`. DS1000Z-E waveform
+downloads use the documented NORM/BYTE blocks and the preamble's voltage calibration;
+offline tests cover both VISA read paths. Validation on a real Z-E instrument is pending.
+RAW-memory download is not implemented.
 
 **Rigol DHO series (12-bit):**
 
