@@ -1,6 +1,7 @@
 """Unit tests for rigol_mcp.scope — transport selection, backend-aware block reads,
 SCPI helpers and parsing. All VISA interaction is faked (see conftest)."""
 
+import pyvisa
 import pytest
 
 from rigol_mcp import scope as sc
@@ -28,6 +29,19 @@ def test_usb_preferred_unset():
 def test_lan_resource_string(monkeypatch):
     monkeypatch.setenv("RIGOL_IP", "192.168.1.50")
     assert sc.get_lan_resource_string() == "TCPIP0::192.168.1.50::5555::SOCKET"
+
+
+def test_lan_resource_string_vxi11(monkeypatch):
+    monkeypatch.setenv("RIGOL_IP", "192.168.1.50")
+    monkeypatch.setenv("RIGOL_LAN_PROTOCOL", "vxi11")
+    assert sc.get_lan_resource_string() == "TCPIP0::192.168.1.50::INSTR"
+
+
+def test_lan_resource_string_rejects_unknown_protocol(monkeypatch):
+    monkeypatch.setenv("RIGOL_IP", "192.168.1.50")
+    monkeypatch.setenv("RIGOL_LAN_PROTOCOL", "hislip")
+    with pytest.raises(ValueError, match="socket.*vxi11"):
+        sc.get_lan_resource_string()
 
 
 def test_lan_resource_string_missing_ip_raises():
@@ -215,6 +229,14 @@ def test_connection_info_lan_configured(monkeypatch):
     assert info["lan_target"] == "TCPIP0::192.168.1.47::5555::SOCKET"
 
 
+def test_connection_info_lan_vxi11(monkeypatch):
+    monkeypatch.setenv("RIGOL_IP", "192.168.1.47")
+    monkeypatch.setenv("RIGOL_LAN_PROTOCOL", "vxi11")
+    info = sc.connection_info()
+    assert info["RIGOL_LAN_PROTOCOL"] == "vxi11"
+    assert info["lan_target"] == "TCPIP0::192.168.1.47::INSTR"
+
+
 def test_connection_info_usb_configured(monkeypatch):
     monkeypatch.setenv("RIGOL_USB", "1")
     monkeypatch.setenv("RIGOL_IP", "192.168.1.47")  # kept but not used
@@ -288,6 +310,32 @@ def test_read_block_via_bytecount():
     payload = b"1.0,2.0,3.0"
     s = FakeScope(read_buffer=make_block(payload))
     assert sc._read_block_via_bytecount(s) == payload
+
+
+def test_read_block_via_bytecount_accepts_missing_terminator():
+    payload = b"\x00\x0a\xff"
+    header = b"#1" + str(len(payload)).encode()
+    s = FakeScope(read_buffer=header + payload)
+    s.timeout = 2500
+    assert sc._read_block_via_bytecount(s) == payload
+    assert s.timeout == 2500
+
+
+def test_read_block_via_bytecount_optional_terminator_timeout_is_clean():
+    payload = b"abc"
+
+    class NoTerminatorScope(FakeScope):
+        def read_bytes(self, count):
+            if self._pos >= len(self._buf):
+                raise pyvisa.errors.VisaIOError(
+                    pyvisa.constants.StatusCode.error_timeout
+                )
+            return super().read_bytes(count)
+
+    s = NoTerminatorScope(read_buffer=b"#13" + payload)
+    s.timeout = 2500
+    assert sc._read_block_via_bytecount(s) == payload
+    assert s.timeout == 2500
 
 
 def test_read_block_via_message_returns_payload_and_restores_termination():

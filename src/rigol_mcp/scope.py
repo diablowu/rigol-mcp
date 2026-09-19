@@ -88,7 +88,12 @@ def get_lan_resource_string() -> str:
     ip = os.environ.get("RIGOL_IP")
     if not ip:
         raise RuntimeError("RIGOL_IP environment variable is not set")
-    return f"TCPIP0::{ip}::5555::SOCKET"
+    protocol = os.environ.get("RIGOL_LAN_PROTOCOL", "socket").strip().lower()
+    if protocol == "socket":
+        return f"TCPIP0::{ip}::5555::SOCKET"
+    if protocol == "vxi11":
+        return f"TCPIP0::{ip}::INSTR"
+    raise ValueError("RIGOL_LAN_PROTOCOL must be 'socket' or 'vxi11'")
 
 
 def find_usb_resource_string(rm: pyvisa.ResourceManager) -> str:
@@ -444,6 +449,7 @@ def connection_info() -> dict:
     """
     rigol_usb    = os.environ.get("RIGOL_USB", "").strip()
     rigol_ip     = os.environ.get("RIGOL_IP", "").strip()
+    lan_protocol = os.environ.get("RIGOL_LAN_PROTOCOL", "socket").strip().lower()
     rigol_serial = os.environ.get("RIGOL_USB_SERIAL", "").strip()
     info: dict = {
         "transport": "USB" if usb_in_use() else "LAN",
@@ -454,8 +460,13 @@ def connection_info() -> dict:
         info["RIGOL_USB_SERIAL"] = rigol_serial or "(unset → any Rigol scope)"
         info["backend_hint"]     = _usb_backend_hint or "(none yet — will auto-detect)"
     else:
-        info["lan_target"] = (f"TCPIP0::{rigol_ip}::5555::SOCKET"
-                              if rigol_ip else "(RIGOL_IP not set)")
+        info["RIGOL_LAN_PROTOCOL"] = lan_protocol or "socket"
+        if not rigol_ip:
+            info["lan_target"] = "(RIGOL_IP not set)"
+        elif lan_protocol == "vxi11":
+            info["lan_target"] = f"TCPIP0::{rigol_ip}::INSTR"
+        else:
+            info["lan_target"] = f"TCPIP0::{rigol_ip}::5555::SOCKET"
     if _scope is not None:
         info["session"]  = "cached/open"
         info["resource"] = getattr(_scope, "resource_name", "?")
@@ -852,15 +863,39 @@ def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
         raise ValueError(f"Expected TMC block header starting with '#', got {prefix!r}")
     n = int(prefix[1:2])
     data_length = int(scope.read_bytes(n))
-    raw = scope.read_bytes(data_length + 1)  # +1 for the trailing newline
-    if len(raw) != data_length + 1:
+    data = scope.read_bytes(data_length)
+    if len(data) != data_length:
         raise ValueError(
-            f"Truncated block: header declared {data_length} payload bytes plus newline, "
-            f"received {len(raw)} bytes"
+            f"Truncated block: header declared {data_length} payload bytes, "
+            f"received {len(data)} bytes"
         )
-    if raw[-1:] != b'\n':
-        raise ValueError(f"Expected \\n after definite-length block, got {raw[-1:]!r}")
-    return raw[:-1]
+    _consume_optional_block_terminator(scope)
+    return data
+
+
+def _consume_optional_block_terminator(scope: pyvisa.resources.Resource) -> None:
+    """Consume a trailing LF when the instrument sends one, without requiring it.
+
+    DS1000Z-E firmware can finish a binary ``:WAV:DATA?`` response at the final payload
+    byte on its raw LAN socket.  Requiring one extra byte therefore waits for data that
+    never arrives and eventually leaves the scope's single-client SCPI service wedged.
+    Other DS1000Z transports append LF, which must still be consumed before the next
+    query.  Probe for that optional byte with a short timeout after the complete,
+    header-declared payload has already been received.
+    """
+    saved_timeout = scope.timeout
+    try:
+        scope.timeout = 100
+        try:
+            terminator = scope.read_bytes(1)
+        except pyvisa.errors.VisaIOError as error:
+            if error.error_code == pyvisa.constants.StatusCode.error_timeout:
+                return
+            raise
+    finally:
+        scope.timeout = saved_timeout
+    if terminator not in (b"", b"\n"):
+        raise ValueError(f"Unexpected byte after definite-length block: {terminator!r}")
 
 
 def screenshot_png(scope: pyvisa.resources.Resource) -> bytes:

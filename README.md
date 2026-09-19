@@ -103,6 +103,7 @@ RIGOL_IP=192.168.1.123
 | Variable | Default | Description |
 |---|---|---|
 | `RIGOL_IP` | (required for LAN) | Scope IP address |
+| `RIGOL_LAN_PROTOCOL` | `socket` | LAN VISA transport: `socket` for raw TCP port 5555, or `vxi11` for the instrument's VXI-11 service. |
 | `RIGOL_USB` | (unset) | Set to `1` to connect over USB instead of LAN. The first Rigol USB scope is found automatically. |
 | `RIGOL_USB_SERIAL` | (unset) | When several Rigol scopes are on USB, pin a specific one by serial number. |
 | `RIGOL_ENABLE_SEND_RAW` | (unset) | Set to `1` to enable the `send_raw` tool (arbitrary SCPI). Off by default — see [Tools](#tools). |
@@ -284,7 +285,9 @@ The VISA connection is cached across tool calls (one connection per server sessi
 
 ## SCPI Transport
 
-By default the server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::SOCKET`), not VXI-11. This avoids the NI-VISA dependency and works with the pure-Python `pyvisa-py` backend. It also eliminates the VXI-11 handshake overhead, making individual commands faster.
+By default the server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::SOCKET`). This avoids the NI-VISA dependency and works with the pure-Python `pyvisa-py` backend. It also eliminates the VXI-11 handshake overhead, making individual commands faster.
+
+Set `RIGOL_LAN_PROTOCOL=vxi11` to use the scope's VXI-11 service (`TCPIP0::<ip>::INSTR`) through the same pure-Python backend. This is also a useful recovery path if an interrupted raw binary transfer has left the port 5555 service waiting on an old connection.
 
 When `RIGOL_USB` is set, the server instead connects over **USBTMC** (`USB0::0x1AB1::<model>::<serial>::INSTR`), discovering the scope automatically. It auto-selects whichever VISA backend can see the scope:
 
