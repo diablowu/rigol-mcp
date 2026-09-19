@@ -449,18 +449,6 @@ def test_check_scpi_error(resp, expected):
     assert sc.check_scpi_error(s) == expected
 
 
-def test_check_scpi_error_raw_socket_accepts_missing_lf():
-    s = FakeScope(
-        read_buffer=b'0,"No error"',
-        resource_name="TCPIP0::192.168.1.47::5555::SOCKET",
-    )
-    s.responses["*IDN?"] = "RIGOL TECHNOLOGIES,DHO924S,SN,1.0"
-    s.timeout = 30_000
-    assert sc.check_scpi_error(s) is None
-    assert s.written == [":SYSTem:ERRor?"]
-    assert s.timeout == 30_000
-
-
 def test_ds1000ze_raw_socket_checks_errors_over_vxi11(monkeypatch):
     monkeypatch.setenv("RIGOL_IP", "192.168.1.47")
     raw = FakeScope(
@@ -483,7 +471,9 @@ def test_ds1000ze_raw_socket_checks_errors_over_vxi11(monkeypatch):
     assert sc.check_scpi_error(raw) is None
     assert ":SYSTem:ERRor?" not in raw.written
     assert vxi.closed is True
-    assert managers[0].closed is True
+    assert managers[0].closed is False
+    assert raw.closed is False
+    assert sc.idn(raw).startswith("RIGOL TECHNOLOGIES,DS1202Z-E")
 
 
 # --------------------------------------------------------------------------- measure validation

@@ -351,50 +351,10 @@ def _query_scpi_error(scope: pyvisa.resources.Resource) -> str:
                     error_scope.close()
                 except Exception:
                     pass
-            _close_rm(rm)
-    return _query_scpi_line(scope, ":SYSTem:ERRor?")
-
-
-def _query_scpi_line(scope: pyvisa.resources.Resource, command: str) -> str:
-    """Query one SCPI text response, tolerating a missing LF on raw TCP sockets.
-
-    DS1202Z-E firmware occasionally returns ``:SYSTem:ERRor?`` without a trailing LF
-    after measurement or waveform operations.  A normal VISA ``query`` then waits for
-    the 30-second session timeout and the abandoned connection can occupy the scope's
-    single-client port 5555 service.  Reading one byte at a time lets VISA return each
-    available byte immediately; a short idle timeout terminates an unterminated line.
-    Message-framed VXI-11 and USB sessions keep the normal query path.
-    """
-    resource_name = str(getattr(scope, "resource_name", "")).upper()
-    if not resource_name.endswith("::SOCKET"):
-        return scope.query(command).strip()
-
-    scope.write(command)
-    saved_timeout = scope.timeout
-    data = bytearray()
-    try:
-        scope.timeout = 1000
-        for _ in range(512):
-            try:
-                chunk = scope.read_bytes(1)
-            except pyvisa.errors.VisaIOError as error:
-                if (error.error_code == pyvisa.constants.StatusCode.error_timeout
-                        and data):
-                    break
-                raise
-            if not chunk:
-                if data:
-                    break
-                raise ValueError(f"Empty response to {command}")
-            if chunk == b"\n":
-                break
-            if chunk != b"\r":
-                data.extend(chunk)
-        else:
-            raise ValueError(f"Response to {command} exceeded 512 bytes")
-    finally:
-        scope.timeout = saved_timeout
-    return data.decode("ascii").strip()
+            # ResourceManager("@py") is cached by PyVISA. Closing it here would
+            # also close the primary raw-socket session. Only the temporary resource
+            # belongs to this operation; the manager lives for the server lifetime.
+    return scope.query(":SYSTem:ERRor?").strip()
 
 
 def get_cursor_mode(scope: pyvisa.resources.Resource) -> str:
@@ -950,12 +910,10 @@ def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
 def _consume_optional_block_terminator(scope: pyvisa.resources.Resource) -> None:
     """Consume a trailing LF when the instrument sends one, without requiring it.
 
-    DS1000Z-E firmware can finish a binary ``:WAV:DATA?`` response at the final payload
-    byte on its raw LAN socket.  Requiring one extra byte therefore waits for data that
-    never arrives and eventually leaves the scope's single-client SCPI service wedged.
-    Other DS1000Z transports append LF, which must still be consumed before the next
-    query.  Probe for that optional byte with a short timeout after the complete,
-    header-declared payload has already been received.
+    The block header determines the payload size. A sender without a trailing LF
+    must not make a complete payload wait for the full session timeout. When LF is
+    present, consume it before the next query. Probe only after receiving the complete
+    header-declared payload; a missing or truncated payload still raises an error.
     """
     saved_timeout = scope.timeout
     try:
