@@ -197,6 +197,63 @@ Add to your `.mcp.json` (or Claude Desktop MCP config):
 
 For **USB**, replace the `RIGOL_IP` entry in `env` with `"RIGOL_USB": "1"` (see [USB connection](#usb-connection)).
 
+## ChatGPT Setup
+
+ChatGPT does not load the local `.mcp.json` configuration shown above. It connects to
+an MCP server through either a public HTTPS Streamable HTTP endpoint or an
+[OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+This project currently exposes a local `stdio` server, so the tunnel is the direct fit:
+it can start the command locally without publishing the oscilloscope or TCP port 5555
+to the internet.
+
+1. Configure this project's `.env` file. For a DS1202Z-E over LAN:
+
+   ```dotenv
+   RIGOL_USB=0
+   RIGOL_IP=192.168.1.123
+   RIGOL_LAN_PROTOCOL=socket
+   RIGOL_MODEL=DS1202Z-E
+   ```
+
+2. Create a tunnel in the
+   [OpenAI Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels),
+   associate it with the ChatGPT workspace that will use it, and download the current
+   `tunnel-client` from that page.
+
+3. Initialize and verify a local `stdio` profile. This PowerShell example assumes `uv`
+   and `tunnel-client` are on `PATH`:
+
+   ```powershell
+   $env:CONTROL_PLANE_API_KEY = "sk-..."
+
+   tunnel-client init `
+     --sample sample_mcp_stdio_local `
+     --profile rigol-local `
+     --tunnel-id tunnel_0123456789abcdef0123456789abcdef `
+     --mcp-command 'uv --directory "C:\path\to\rigol-mcp" run rigol-mcp'
+
+   tunnel-client doctor --profile rigol-local --explain
+   tunnel-client run --profile rigol-local
+   ```
+
+   Keep `tunnel-client run` running while ChatGPT uses the scope. If `uv` is not on the
+   service account's `PATH`, put the absolute path to `uv.exe` in `--mcp-command`.
+
+4. In ChatGPT, open **Settings → Security and login** and enable **Developer mode**.
+   Go to **ChatGPT Plugins**, select the plus button, choose **Tunnel** under Connection,
+   select the tunnel (or paste its `tunnel_id`), create the connection, and review the
+   discovered tools. Developer-mode availability can depend on account and workspace
+   policy.
+
+5. Start a new chat, add the Rigol connection from the tools menu, and call `idn` first.
+   Confirm that it reports `DS1202Z-E`, LAN transport, and only CHAN1/CHAN2 before making
+   measurements.
+
+For a separately deployed public server, ChatGPT expects a public HTTPS Streamable HTTP
+endpoint, normally ending in `/mcp`. The present entry point is `stdio`; using that route
+therefore requires adding an HTTP transport/deployment layer first. See OpenAI's
+[connection instructions](https://developers.openai.com/plugins/deploy/connect-chatgpt).
+
 ## Tools
 
 ### Identification & State
