@@ -19,7 +19,7 @@ load_dotenv()
 
 import mcp.types as types
 import pyvisa
-from mcp.server import Server
+from mcp.server import Server, NotificationOptions
 from mcp.server.stdio import stdio_server
 
 from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
@@ -32,6 +32,7 @@ from rigol_mcp.scope import (
     idn, connection_info, set_driver_from_idn,
     measure, measure_between, MEASURE_ITEMS, MEASURE_ITEMS_TWO_SOURCE,
     get_scope_state, set_channel, set_timebase, set_trigger, get_waveform,
+    advertised_capabilities, get_channel_state, get_timebase_state, get_trigger_state,
 )
 
 server = Server(
@@ -398,6 +399,16 @@ async def list_tools() -> list[types.Tool]:
     # send_raw is an arbitrary-SCPI escape hatch — only expose it when explicitly enabled.
     if not _send_raw_enabled():
         tools = [t for t in tools if t.name != "send_raw"]
+    capabilities = advertised_capabilities()
+    channels = list(capabilities.channels)
+    channel_range = f"CHAN1–CHAN{capabilities.analog_channels}"
+    for tool in tools:
+        tool.description = tool.description.replace("CHAN1–CHAN4", channel_range)
+        for key, schema in tool.inputSchema.get("properties", {}).items():
+            if key in {"channel", "source1", "source2"}:
+                schema["enum"] = channels.copy()
+            elif tool.name == "set_trigger" and key == "source":
+                schema["enum"] = list(capabilities.trigger_sources)
     return tools
 
 
@@ -441,7 +452,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             # Populate the driver cache from the IDN we already have, so the diagnostic
             # below shows which dialect was selected. Avoids a second *IDN? round-trip
             # that get_driver(scope) would otherwise do on first dialect use.
+            before = advertised_capabilities()
             set_driver_from_idn(idn_str)
+            if advertised_capabilities() != before:
+                try:
+                    session = server.request_context.session
+                except LookupError:
+                    pass  # Direct offline calls have no MCP request context.
+                else:
+                    await session.send_tool_list_changed()
             info = connection_info()
             diag = "\n".join(f"  {k:18s}: {v}" for k, v in info.items())
             return [types.TextContent(type="text",
@@ -465,38 +484,40 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             v = arguments.get(key)
             return float(v) if v is not None else None
 
-        await _call(
-            set_channel,
-            arguments["channel"],
-            display=arguments.get("display"),
-            scale=_f("scale_v_div"),
-            offset=_f("offset_v"),
-            coupling=arguments.get("coupling"),
-            probe=_f("probe"),
-        )
-        state = await _call(get_scope_state)
-        ch = arguments["channel"].upper()
-        return [types.TextContent(type="text", text=json.dumps(state["channels"][ch], indent=2))]
+        def configure(scope):
+            set_channel(
+                scope, arguments["channel"], display=arguments.get("display"),
+                scale=_f("scale_v_div"), offset=_f("offset_v"),
+                coupling=arguments.get("coupling"), probe=_f("probe"),
+            )
+            return get_channel_state(scope, arguments["channel"])
+
+        state = await _call(configure)
+        return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "set_timebase":
         def _f(key):
             v = arguments.get(key)
             return float(v) if v is not None else None
 
-        await _call(set_timebase, scale=_f("scale_s_div"), offset=_f("offset_s"))
-        state = await _call(get_scope_state)
-        return [types.TextContent(type="text", text=json.dumps(state["timebase"], indent=2))]
+        def configure(scope):
+            set_timebase(scope, scale=_f("scale_s_div"), offset=_f("offset_s"))
+            return get_timebase_state(scope)
+
+        state = await _call(configure)
+        return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "set_trigger":
         level = arguments.get("level")
-        await _call(
-            set_trigger,
-            source=arguments.get("source"),
-            slope=arguments.get("slope"),
-            level=float(level) if level is not None else None,
-        )
-        state = await _call(get_scope_state)
-        return [types.TextContent(type="text", text=json.dumps(state["trigger"], indent=2))]
+        def configure(scope):
+            set_trigger(
+                scope, source=arguments.get("source"), slope=arguments.get("slope"),
+                level=float(level) if level is not None else None,
+            )
+            return get_trigger_state(scope)
+
+        state = await _call(configure)
+        return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "measure":
         value = await _call(measure, arguments["channel"], arguments["item"])
@@ -568,7 +589,12 @@ def main() -> None:
 
 async def _run() -> None:
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+        await server.run(
+            read_stream, write_stream,
+            server.create_initialization_options(
+                notification_options=NotificationOptions(tools_changed=True)
+            ),
+        )
 
 
 if __name__ == "__main__":
