@@ -140,6 +140,7 @@ async def test_setters_read_back_only_relevant_fields_in_one_call(monkeypatch, n
 
     async def call(function, *args, **kwargs):
         calls.append(function)
+        kwargs.pop("retry", None)
         return function(scope, *args, **kwargs)
 
     monkeypatch.setattr(srv, "_call", call)
@@ -157,6 +158,7 @@ async def test_autoscale_readback_on_two_channels(monkeypatch):
     scope = ModelScope()
 
     async def call(function, *args, **kwargs):
+        kwargs.pop("retry", None)
         return function(scope, *args, **kwargs)
 
     monkeypatch.setattr(srv, "_call", call)

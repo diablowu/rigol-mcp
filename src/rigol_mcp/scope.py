@@ -441,12 +441,27 @@ def stop(scope: pyvisa.resources.Resource) -> str:
     return scope.query(":TRIGger:STATus?").strip()
 
 
-def single(scope: pyvisa.resources.Resource) -> str:
-    """Capture a single acquisition then stop. Returns trigger status."""
+def trigger_status(scope: pyvisa.resources.Resource) -> str:
+    """Return the scope trigger/acquisition state without changing acquisition."""
+    return scope.query(":TRIGger:STATus?").strip()
+
+
+def arm_single(scope: pyvisa.resources.Resource) -> None:
+    """Arm one acquisition without waiting for a trigger event."""
     scope.write(":SINGle")
     if err := check_scpi_error(scope):
         raise RuntimeError(f"SCPI error after :SINGle: {err}")
-    return scope.query(":TRIGger:STATus?").strip()
+
+
+def single(scope: pyvisa.resources.Resource) -> str:
+    """Arm one acquisition and return the immediately observed trigger status.
+
+    A status of ``WAIT`` means the scope is armed but no trigger has arrived. Callers
+    that need completion semantics should use the bounded polling transaction in the
+    MCP server instead of treating this immediate status as a completed capture.
+    """
+    arm_single(scope)
+    return trigger_status(scope)
 
 
 def autoscale(scope: pyvisa.resources.Resource) -> None:

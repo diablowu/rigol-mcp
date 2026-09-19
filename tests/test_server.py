@@ -1,6 +1,7 @@
 """Unit tests for rigol_mcp.server — the _call retry/recovery wrapper and the
 backend-aware screenshot reconnect. VISA access is faked; no hardware involved."""
 
+import json
 import time
 
 import pyvisa
@@ -58,6 +59,19 @@ async def test_call_exhausts_attempts_then_raises():
     assert len(invalidated) == srv._MAX_ATTEMPTS  # invalidate after every failed attempt
 
 
+async def test_call_does_not_replay_non_idempotent_action_after_transport_error():
+    calls = {"n": 0}
+
+    def action(scope):
+        calls["n"] += 1
+        raise _tmo()
+
+    with pytest.raises(srv.ActionOutcomeUnknown, match="not retried"):
+        await srv._call(action, retry=False)
+    assert calls["n"] == 1
+    assert len(invalidated) == 1
+
+
 async def test_call_does_not_retry_non_communication_errors():
     calls = {"n": 0}
 
@@ -100,6 +114,104 @@ async def test_call_enforces_min_interval(monkeypatch):
     await srv._call(lambda scope: "ok")
     assert slept and slept[0] > 0
     assert slept[0] <= srv._MIN_INTERVAL + 0.01
+
+
+# --------------------------------------------------------------------------- single-capture transaction
+
+async def test_single_action_reports_unknown_without_sending_a_second_command(monkeypatch):
+    writes = {"n": 0}
+
+    def interrupted_single(scope):
+        writes["n"] += 1
+        raise _tmo()
+
+    monkeypatch.setattr(srv, "single", interrupted_single)
+    monkeypatch.setattr(srv, "trigger_status", lambda scope: "WAIT")
+
+    result = await srv.call_tool("single", {})
+    payload = json.loads(result[0].text)
+    assert writes["n"] == 1
+    assert payload["outcome"] == "unknown"
+    assert payload["trigger_status_after_error"] == "WAIT"
+
+
+async def test_single_capture_completes_only_after_observed_trigger_and_stop(monkeypatch):
+    arms = {"n": 0}
+    statuses = iter(["TD", "WAIT", "TD", "STOP"])
+
+    def arm(scope):
+        arms["n"] += 1
+
+    monkeypatch.setattr(srv, "arm_single", arm)
+    monkeypatch.setattr(srv, "trigger_status", lambda scope: next(statuses))
+
+    result = await srv._single_capture(timeout_s=0.2, poll_s=0.001)
+    assert arms["n"] == 1
+    assert result == {
+        "action": "single_capture",
+        "outcome": "completed",
+        "status_before_arm": "TD",
+        "final_status": "STOP",
+        "trigger_observed": True,
+        "statuses": ["WAIT", "TD", "STOP"],
+    }
+
+
+async def test_single_capture_stops_after_an_untriggered_deadline(monkeypatch):
+    stops = {"n": 0}
+
+    monkeypatch.setattr(srv, "arm_single", lambda scope: None)
+    statuses = iter(["TD"] + ["WAIT"] * 20)
+    monkeypatch.setattr(srv, "trigger_status", lambda scope: next(statuses))
+
+    def stop_after_timeout(scope):
+        stops["n"] += 1
+        return "STOP"
+
+    monkeypatch.setattr(srv, "stop", stop_after_timeout)
+
+    result = await srv._single_capture(timeout_s=0.1, poll_s=0.02)
+    assert stops["n"] == 1
+    assert result["outcome"] == "timed_out_waiting_for_trigger"
+    assert result["status_before_arm"] == "TD"
+    assert result["final_status"] == "STOP"
+    assert result["trigger_observed"] is False
+    assert result["statuses"] and set(result["statuses"]) == {"WAIT"}
+
+
+async def test_single_capture_reports_unknown_after_arm_transport_error_without_replay(monkeypatch):
+    arms = {"n": 0}
+
+    def interrupted_arm(scope):
+        arms["n"] += 1
+        raise _tmo()
+
+    monkeypatch.setattr(srv, "arm_single", interrupted_arm)
+    statuses = iter(["TD", "WAIT"])
+    monkeypatch.setattr(srv, "trigger_status", lambda scope: next(statuses))
+
+    result = await srv._single_capture(timeout_s=0.2, poll_s=0.02)
+    assert arms["n"] == 1
+    assert result["outcome"] == "unknown"
+    assert result["status_before_arm"] == "TD"
+    assert result["trigger_status_after_error"] == "WAIT"
+    assert result["statuses"] == []
+
+
+@pytest.mark.parametrize("arguments", [
+    {"timeout_s": 0},
+    {"timeout_s": float("inf")},
+    {"poll_interval_s": 0.001},
+    {"poll_interval_s": float("nan")},
+])
+def test_single_capture_timing_rejects_invalid_values(arguments):
+    with pytest.raises(ValueError):
+        srv._single_capture_timing(arguments)
+
+
+async def test_single_capture_is_advertised():
+    names = {tool.name for tool in await srv.list_tools()}
+    assert "single_capture" in names
 
 
 # --------------------------------------------------------------------------- screenshot reconnect

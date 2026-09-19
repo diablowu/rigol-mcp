@@ -163,6 +163,7 @@ async def test_mcp_samples_keep_time_and_voltage_output_contract(monkeypatch):
     scope = byte_scope(bytes([120, 130, 140]), preamble="0,0,3,1,1e-6,0,0,0.1,3,127")
 
     async def call(function, *args, **kwargs):
+        kwargs.pop("retry", None)
         return function(scope, *args, **kwargs)
 
     monkeypatch.setattr(srv, "_call", call)

@@ -269,7 +269,8 @@ therefore requires adding an HTTP transport/deployment layer first. See OpenAI's
 |---|---|
 | `run` | Start continuous acquisition |
 | `stop` | Stop and freeze display |
-| `single` | Arm for one trigger event, then stop |
+| `single` | Arm for one trigger event and return the immediate trigger status; `WAIT` means it is still armed |
+| `single_capture` | Arm once, wait up to a bounded deadline for a trigger, and return an explicit completion/timeout/unknown outcome; `completed` requires observing TD before STOP, and `:SINGle` is never repeated after an I/O fault |
 | `autoscale` | Auto-configure timebase, vertical scale, and trigger |
 
 ### Configuration

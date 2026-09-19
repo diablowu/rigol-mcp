@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from rigol_mcp.scope import (
     screenshot_png,
     get_cursor_mode, set_cursor_mode, set_cursor_positions, get_cursor_values,
     send_raw, check_scpi_error,
-    run, stop, single, autoscale,
+    run, stop, single, arm_single, trigger_status, autoscale,
     idn, connection_info, set_driver_from_idn,
     measure, measure_between, MEASURE_ITEMS, MEASURE_ITEMS_TWO_SOURCE,
     get_scope_state, set_channel, set_timebase, set_trigger, get_waveform,
@@ -58,6 +59,12 @@ _MIN_INTERVAL = 0.1          # 100 ms minimum between SCPI operations
 _POST_SCREENSHOT_DELAY = 2.0 # scope needs recovery time after large display transfer
 _MAX_ATTEMPTS = 3            # initial try + 2 reconnect-and-retry attempts
 _RETRY_BACKOFF = 0.2         # seconds to let a flaky USB link settle before retrying
+_DEFAULT_SINGLE_CAPTURE_TIMEOUT_S = 5.0
+_DEFAULT_SINGLE_CAPTURE_POLL_S = 0.1
+_MIN_SINGLE_CAPTURE_TIMEOUT_S = 0.1
+_MAX_SINGLE_CAPTURE_TIMEOUT_S = 60.0
+_MIN_SINGLE_CAPTURE_POLL_S = 0.02
+_MAX_SINGLE_CAPTURE_POLL_S = 1.0
 
 # Communication faults that warrant a reconnect-and-retry. Other exceptions (e.g. bad
 # arguments, SCPI errors) are bugs/usage errors and must propagate unretried.
@@ -72,28 +79,182 @@ def _send_raw_enabled() -> bool:
     return os.environ.get(_SEND_RAW_ENV, "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
-async def _call(fn, *args, **kwargs):
+class ActionOutcomeUnknown(RuntimeError):
+    """A transport fault occurred while a non-idempotent action may have run."""
+
+
+async def _wait_for_intercommand_gap() -> None:
+    """Apply the shared SCPI pacing rule while the caller owns ``_scope_lock``."""
+    elapsed = time.monotonic() - _last_call_time
+    if elapsed < _MIN_INTERVAL:
+        await asyncio.sleep(_MIN_INTERVAL - elapsed)
+
+
+async def _call_locked(fn, *args, retry: bool, **kwargs):
+    """Call ``fn`` while holding ``_scope_lock``.
+
+    Query operations can reconnect and replay after a communication error. Actions
+    that may already have changed acquisition/configuration use ``retry=False``: the
+    cached session is discarded, but the command is never sent to the scope a second
+    time and callers receive an explicit unknown-outcome exception.
+    """
+    attempts = _MAX_ATTEMPTS if retry else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(get_scope(), *args, **kwargs)
+        except _RETRYABLE as exc:
+            invalidate_scope()  # a later query/action must establish a clean session
+            if not retry:
+                raise ActionOutcomeUnknown(
+                    "Transport failed while an action may already have reached the scope; "
+                    "the action was not retried and its result is unknown."
+                ) from exc
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(_RETRY_BACKOFF)
+
+
+async def _call(fn, *args, retry: bool = True, **kwargs):
     """Call fn(scope, *args, **kwargs) with the cached connection.
 
     Serialises concurrent calls via a lock, enforces a minimum inter-command gap, and
-    recovers from communication faults by reconnecting and retrying (up to _MAX_ATTEMPTS).
-    USBTMC links in particular occasionally drop the first access after opening or after a
-    large transfer; a reconnect on a fresh session clears it. The last failure propagates.
+    recovers and replays only safe query operations by default. Pass ``retry=False`` for
+    commands that may change scope state. Such commands are never replayed after a
+    transport error; their session is invalidated and :class:`ActionOutcomeUnknown` is
+    raised instead.
     """
     global _last_call_time
     async with _scope_lock:
-        elapsed = time.monotonic() - _last_call_time
-        if elapsed < _MIN_INTERVAL:
-            await asyncio.sleep(_MIN_INTERVAL - elapsed)
+        await _wait_for_intercommand_gap()
         try:
-            for attempt in range(1, _MAX_ATTEMPTS + 1):
+            return await _call_locked(fn, *args, retry=retry, **kwargs)
+        finally:
+            _last_call_time = time.monotonic()
+
+
+async def _observed_trigger_status() -> tuple[str | None, str | None]:
+    """Best-effort query after an action outcome is unknown; never replays the action."""
+    try:
+        return await _call(trigger_status), None
+    except Exception as exc:  # the original action outcome remains unknown either way
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+async def _action_once(action: str, fn, *args):
+    """Run one non-idempotent action and return a structured unknown outcome on I/O loss."""
+    try:
+        return {"action": action, "outcome": "completed", "value": await _call(fn, *args, retry=False)}
+    except ActionOutcomeUnknown as exc:
+        status, recovery_error = await _observed_trigger_status()
+        result = {
+            "action": action,
+            "outcome": "unknown",
+            "reason": str(exc),
+            "trigger_status_after_error": status,
+        }
+        if recovery_error:
+            result["recovery_error"] = recovery_error
+        return result
+
+
+def _single_capture_timing(arguments: dict) -> tuple[float, float]:
+    """Validate bounded single-capture timing arguments."""
+    timeout_s = float(arguments.get("timeout_s", _DEFAULT_SINGLE_CAPTURE_TIMEOUT_S))
+    poll_s = float(arguments.get("poll_interval_s", _DEFAULT_SINGLE_CAPTURE_POLL_S))
+    if not math.isfinite(timeout_s) or not _MIN_SINGLE_CAPTURE_TIMEOUT_S <= timeout_s <= _MAX_SINGLE_CAPTURE_TIMEOUT_S:
+        raise ValueError(
+            f"timeout_s must be finite and between {_MIN_SINGLE_CAPTURE_TIMEOUT_S:g} and "
+            f"{_MAX_SINGLE_CAPTURE_TIMEOUT_S:g} seconds"
+        )
+    if not math.isfinite(poll_s) or not _MIN_SINGLE_CAPTURE_POLL_S <= poll_s <= _MAX_SINGLE_CAPTURE_POLL_S:
+        raise ValueError(
+            f"poll_interval_s must be finite and between {_MIN_SINGLE_CAPTURE_POLL_S:g} and "
+            f"{_MAX_SINGLE_CAPTURE_POLL_S:g} seconds"
+        )
+    return timeout_s, poll_s
+
+
+async def _single_capture(timeout_s: float, poll_s: float) -> dict:
+    """Arm once and observe trigger state through a bounded, serialized transaction."""
+    global _last_call_time
+    statuses: list[str] = []
+    async with _scope_lock:
+        await _wait_for_intercommand_gap()
+        try:
+            status_before_arm = await _call_locked(trigger_status, retry=True)
+            try:
+                await _call_locked(arm_single, retry=False)
+            except ActionOutcomeUnknown as exc:
                 try:
-                    return fn(get_scope(), *args, **kwargs)
-                except _RETRYABLE:
-                    invalidate_scope()  # drop the session so the next attempt reconnects
-                    if attempt == _MAX_ATTEMPTS:
-                        raise
-                    await asyncio.sleep(_RETRY_BACKOFF)
+                    recovered_status = await _call_locked(trigger_status, retry=True)
+                except Exception as recovery_exc:
+                    recovered_status = None
+                    recovery_error = f"{type(recovery_exc).__name__}: {recovery_exc}"
+                else:
+                    recovery_error = None
+                result = {
+                    "action": "single_capture",
+                    "outcome": "unknown",
+                    "reason": str(exc),
+                    "status_before_arm": status_before_arm,
+                    "trigger_status_after_error": recovered_status,
+                    "statuses": statuses,
+                }
+                if recovery_error:
+                    result["recovery_error"] = recovery_error
+                return result
+
+            deadline = time.monotonic() + timeout_s
+            trigger_observed = False
+            while True:
+                try:
+                    status = await _call_locked(trigger_status, retry=True)
+                except _RETRYABLE as exc:
+                    return {
+                        "action": "single_capture",
+                        "outcome": "unknown",
+                        "reason": "Transport failed while waiting for the armed acquisition; "
+                                  "the single command was not retried.",
+                        "status_before_arm": status_before_arm,
+                        "trigger_status_after_error": None,
+                        "recovery_error": f"{type(exc).__name__}: {exc}",
+                        "statuses": statuses,
+                    }
+                statuses.append(status)
+                if status == "TD":
+                    trigger_observed = True
+                if status == "STOP":
+                    return {
+                        "action": "single_capture",
+                        "outcome": "completed" if trigger_observed else "stopped_without_observed_trigger",
+                        "status_before_arm": status_before_arm,
+                        "final_status": status,
+                        "trigger_observed": trigger_observed,
+                        "statuses": statuses,
+                    }
+
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    try:
+                        stop_status = await _call_locked(stop, retry=False)
+                    except ActionOutcomeUnknown as exc:
+                        return {
+                            "action": "single_capture",
+                            "outcome": "unknown",
+                            "reason": f"Timed out waiting for a trigger; :STOP recovery outcome is unknown: {exc}",
+                            "status_before_arm": status_before_arm,
+                            "trigger_observed": trigger_observed,
+                            "statuses": statuses,
+                        }
+                    return {
+                        "action": "single_capture",
+                        "outcome": "timed_out_waiting_for_trigger",
+                        "status_before_arm": status_before_arm,
+                        "final_status": stop_status,
+                        "trigger_observed": trigger_observed,
+                        "statuses": statuses,
+                    }
+                await asyncio.sleep(min(poll_s, remaining_s))
         finally:
             _last_call_time = time.monotonic()
 
@@ -378,13 +539,40 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="single",
             description=(
-                "Arm the scope for a single acquisition; stops automatically after one trigger event. "
-                "Returns trigger status. "
-                "Note: acquisition does not complete until a trigger occurs — "
-                "call stop or check trigger status before reading measurements. "
+                "Arm the scope for a single acquisition and return the immediately observed trigger status. "
+                "WAIT means the scope is still armed, not that a capture completed. "
+                "Use single_capture when a bounded wait and an explicit completion outcome are needed. "
                 "Do not call concurrently with any other rigol tool."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="single_capture",
+            description=(
+                "Arm exactly one single acquisition, then poll trigger status until it stops or the deadline expires. "
+                "Returns a structured outcome: completed, timed_out_waiting_for_trigger, "
+                "stopped_without_observed_trigger, or unknown after a transport fault. "
+                "completed requires observing TD before STOP; stopped_without_observed_trigger "
+                "does not prove that the frozen record is new. "
+                "The scope is stopped on an untriggered timeout. The SINGLE command is never retried. "
+                "Do not call concurrently with any other rigol tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout_s": {
+                        "type": "number", "minimum": _MIN_SINGLE_CAPTURE_TIMEOUT_S,
+                        "maximum": _MAX_SINGLE_CAPTURE_TIMEOUT_S,
+                        "description": "Maximum time to wait for a trigger; default 5 seconds.",
+                    },
+                    "poll_interval_s": {
+                        "type": "number", "minimum": _MIN_SINGLE_CAPTURE_POLL_S,
+                        "maximum": _MAX_SINGLE_CAPTURE_POLL_S,
+                        "description": "Trigger-status polling interval; default 0.1 seconds.",
+                    },
+                },
+                "required": [],
+            },
         ),
         types.Tool(
             name="autoscale",
@@ -492,7 +680,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             )
             return get_channel_state(scope, arguments["channel"])
 
-        state = await _call(configure)
+        state = await _call(configure, retry=False)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "set_timebase":
@@ -504,7 +692,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             set_timebase(scope, scale=_f("scale_s_div"), offset=_f("offset_s"))
             return get_timebase_state(scope)
 
-        state = await _call(configure)
+        state = await _call(configure, retry=False)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "set_trigger":
@@ -516,25 +704,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             )
             return get_trigger_state(scope)
 
-        state = await _call(configure)
+        state = await _call(configure, retry=False)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
     if name == "measure":
-        value = await _call(measure, arguments["channel"], arguments["item"])
+        value = await _call(measure, arguments["channel"], arguments["item"], retry=False)
         return [types.TextContent(
             type="text",
             text=f"{arguments['item']} on {arguments['channel']}: {value}",
         )]
 
     if name == "measure_between":
-        value = await _call(measure_between, arguments["source1"], arguments["source2"], arguments["item"])
+        value = await _call(measure_between, arguments["source1"], arguments["source2"], arguments["item"], retry=False)
         return [types.TextContent(
             type="text",
             text=f"{arguments['item']} from {arguments['source1']} to {arguments['source2']}: {value}",
         )]
 
     if name == "get_waveform":
-        data = await _call(get_waveform, arguments["channel"])
+        data = await _call(get_waveform, arguments["channel"], retry=False)
         if arguments.get("raw_data"):
             return [types.TextContent(type="text", text=json.dumps(data))]
         return [types.TextContent(type="text", text=_describe_waveform(data))]
@@ -544,11 +732,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
         ax = float(arguments["ax"]) if "ax" in arguments else None
         bx = float(arguments["bx"]) if "bx" in arguments else None
         if mode is not None:
-            await _call(set_cursor_mode, mode)
+            await _call(set_cursor_mode, mode, retry=False)
         else:
             mode = await _call(get_cursor_mode)
         if mode.upper() != "OFF" and (ax is not None or bx is not None):
-            await _call(set_cursor_positions, mode, ax=ax, bx=bx)
+            await _call(set_cursor_positions, mode, ax=ax, bx=bx, retry=False)
         values = await _call(get_cursor_values)
         lines = "\n".join(f"{k}: {v}" for k, v in values.items())
         return [types.TextContent(type="text", text=lines)]
@@ -563,7 +751,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
             raise ValueError(
                 f"send_raw is disabled. Set {_SEND_RAW_ENV}=1 to enable arbitrary SCPI commands."
             )
-        response = await _call(send_raw, arguments["command"])
+        response = await _call(send_raw, arguments["command"], retry=arguments["command"].strip().endswith("?"))
         return [types.TextContent(type="text", text=response or "(no response)")]
 
     if name == "check_error":
@@ -572,11 +760,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
 
     if name in ("run", "stop", "single"):
         fn = {"run": run, "stop": stop, "single": single}[name]
-        status = await _call(fn)
-        return [types.TextContent(type="text", text=f"trigger status: {status}")]
+        result = await _action_once(name, fn)
+        if result["outcome"] == "completed":
+            return [types.TextContent(type="text", text=f"trigger status: {result['value']}")]
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "single_capture":
+        timeout_s, poll_s = _single_capture_timing(arguments)
+        result = await _single_capture(timeout_s, poll_s)
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
     if name == "autoscale":
-        await _call(autoscale)
+        result = await _action_once("autoscale", autoscale)
+        if result["outcome"] != "completed":
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
         state = await _call(get_scope_state)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
