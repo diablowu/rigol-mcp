@@ -314,13 +314,87 @@ def check_scpi_error(scope: pyvisa.resources.Resource) -> str | None:
     """
     first_err: str | None = None
     for _ in range(16):
-        response = scope.query(":SYSTem:ERRor?").strip()
+        response = _query_scpi_error(scope)
         # No error returns '0' or '0,"No error"'
         if response == "0" or response.startswith("0,"):
             return first_err
         if first_err is None:
             first_err = response
     return first_err
+
+
+def _query_scpi_error(scope: pyvisa.resources.Resource) -> str:
+    """Read one error-queue entry over a transport safe for the detected model.
+
+    DS1000Z-E port 5555 stops answering ``:SYSTem:ERRor?`` after some measurement and
+    binary-transfer sequences even though ordinary queries on that same session continue
+    to work.  Its documented VXI-11 service remains responsive, so use that independent
+    LAN control channel for error-queue reads while keeping all other traffic on the
+    requested raw socket.  USB, VXI-11, and other model families use their active session.
+    """
+    resource_name = str(getattr(scope, "resource_name", "")).upper()
+    if resource_name.endswith("::SOCKET") and get_driver(scope).name == "DS1000Z-E":
+        ip = os.environ.get("RIGOL_IP", "").strip()
+        if not ip:
+            raise RuntimeError("RIGOL_IP is required for DS1000Z-E error-queue fallback")
+        rm = pyvisa.ResourceManager("@py")
+        error_scope = None
+        try:
+            error_scope = rm.open_resource(f"TCPIP0::{ip}::INSTR", open_timeout=5000)
+            error_scope.timeout = 5000
+            error_scope.write_termination = "\n"
+            error_scope.read_termination = "\n"
+            return error_scope.query(":SYSTem:ERRor?").strip()
+        finally:
+            if error_scope is not None:
+                try:
+                    error_scope.close()
+                except Exception:
+                    pass
+            _close_rm(rm)
+    return _query_scpi_line(scope, ":SYSTem:ERRor?")
+
+
+def _query_scpi_line(scope: pyvisa.resources.Resource, command: str) -> str:
+    """Query one SCPI text response, tolerating a missing LF on raw TCP sockets.
+
+    DS1202Z-E firmware occasionally returns ``:SYSTem:ERRor?`` without a trailing LF
+    after measurement or waveform operations.  A normal VISA ``query`` then waits for
+    the 30-second session timeout and the abandoned connection can occupy the scope's
+    single-client port 5555 service.  Reading one byte at a time lets VISA return each
+    available byte immediately; a short idle timeout terminates an unterminated line.
+    Message-framed VXI-11 and USB sessions keep the normal query path.
+    """
+    resource_name = str(getattr(scope, "resource_name", "")).upper()
+    if not resource_name.endswith("::SOCKET"):
+        return scope.query(command).strip()
+
+    scope.write(command)
+    saved_timeout = scope.timeout
+    data = bytearray()
+    try:
+        scope.timeout = 1000
+        for _ in range(512):
+            try:
+                chunk = scope.read_bytes(1)
+            except pyvisa.errors.VisaIOError as error:
+                if (error.error_code == pyvisa.constants.StatusCode.error_timeout
+                        and data):
+                    break
+                raise
+            if not chunk:
+                if data:
+                    break
+                raise ValueError(f"Empty response to {command}")
+            if chunk == b"\n":
+                break
+            if chunk != b"\r":
+                data.extend(chunk)
+        else:
+            raise ValueError(f"Response to {command} exceeded 512 bytes")
+    finally:
+        scope.timeout = saved_timeout
+    return data.decode("ascii").strip()
 
 
 def get_cursor_mode(scope: pyvisa.resources.Resource) -> str:

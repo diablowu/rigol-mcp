@@ -289,6 +289,11 @@ By default the server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::S
 
 Set `RIGOL_LAN_PROTOCOL=vxi11` to use the scope's VXI-11 service (`TCPIP0::<ip>::INSTR`) through the same pure-Python backend. This is also a useful recovery path if an interrupted raw binary transfer has left the port 5555 service waiting on an old connection.
 
+On DS1000Z-E, raw-socket mode uses the instrument's VXI-11 service only for
+`:SYSTem:ERRor?` queue reads. Real-hardware testing found that port 5555 can stop answering
+that query after measurement or binary-transfer sequences while ordinary raw queries keep
+working. Waveforms and all other commands remain on the selected raw socket.
+
 When `RIGOL_USB` is set, the server instead connects over **USBTMC** (`USB0::0x1AB1::<model>::<serial>::INSTR`), discovering the scope automatically. It auto-selects whichever VISA backend can see the scope:
 
 - **`@py`** (`pyvisa-py` + `pyusb` + bundled `libusb`) — for a USB interface bound to **WinUSB** (no NI-VISA needed).
