@@ -32,8 +32,10 @@ Unknown signal (square wave into LCR trap), wrong channel enabled, invalid timeb
 | DS1202Z-E | 2 analog | 200 MHz; channel limits covered by offline tests, hardware validation pending |
 | DS1102Z-E | 2 analog | 100 MHz; channel limits covered by offline tests, hardware validation pending |
 
-Channel queries and validation use the model reported by `*IDN?`. This channel
-compatibility change does not establish waveform framing or RAW-memory support on Z-E.
+Channel queries and validation use the model reported by `*IDN?`. DS1000Z-E waveform
+downloads use the documented NORM/BYTE blocks and the preamble's voltage calibration;
+offline tests cover both VISA read paths. Validation on a real Z-E instrument is pending.
+RAW-memory download is not implemented.
 
 **Rigol DHO series (12-bit):**
 
@@ -101,6 +103,7 @@ RIGOL_IP=192.168.1.123
 | Variable | Default | Description |
 |---|---|---|
 | `RIGOL_IP` | (required for LAN) | Scope IP address |
+| `RIGOL_LAN_PROTOCOL` | `socket` | LAN VISA transport: `socket` for raw TCP port 5555, or `vxi11` for the instrument's VXI-11 service. |
 | `RIGOL_USB` | (unset) | Set to `1` to connect over USB instead of LAN. The first Rigol USB scope is found automatically. |
 | `RIGOL_USB_SERIAL` | (unset) | When several Rigol scopes are on USB, pin a specific one by serial number. |
 | `RIGOL_ENABLE_SEND_RAW` | (unset) | Set to `1` to enable the `send_raw` tool (arbitrary SCPI). Off by default — see [Tools](#tools). |
@@ -282,7 +285,14 @@ The VISA connection is cached across tool calls (one connection per server sessi
 
 ## SCPI Transport
 
-By default the server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::SOCKET`), not VXI-11. This avoids the NI-VISA dependency and works with the pure-Python `pyvisa-py` backend. It also eliminates the VXI-11 handshake overhead, making individual commands faster.
+By default the server connects using **raw socket VISA** (`TCPIP0::<ip>::5555::SOCKET`). This avoids the NI-VISA dependency and works with the pure-Python `pyvisa-py` backend. It also eliminates the VXI-11 handshake overhead, making individual commands faster.
+
+Set `RIGOL_LAN_PROTOCOL=vxi11` to use the scope's VXI-11 service (`TCPIP0::<ip>::INSTR`) through the same pure-Python backend. This is also a useful recovery path if an interrupted raw binary transfer has left the port 5555 service waiting on an old connection.
+
+On DS1000Z-E, raw-socket mode uses the instrument's VXI-11 service only for
+`:SYSTem:ERRor?` queue reads. Real-hardware testing found that port 5555 can stop answering
+that query after measurement or binary-transfer sequences while ordinary raw queries keep
+working. Waveforms and all other commands remain on the selected raw socket.
 
 When `RIGOL_USB` is set, the server instead connects over **USBTMC** (`USB0::0x1AB1::<model>::<serial>::INSTR`), discovering the scope automatically. It auto-selects whichever VISA backend can see the scope:
 

@@ -15,6 +15,8 @@ Drivers are stateless singletons: every method receives the live pyvisa ``scope`
 than holding a reference, so one instance per family is shared across all connections.
 """
 
+import math
+
 import pyvisa
 
 # DS1000Z screen geometry, used for pixel-based cursor positioning. These live here
@@ -53,6 +55,7 @@ class ScopeDriver:
     """
 
     name: str = "generic"
+    waveform_format: str = "ASC"
     # Two-source (delay/phase) item names this family accepts, and aliases mapping the
     # canonical DS1000Z names onto family-specific ones (e.g. RDELAY -> RRDELAY on DHO).
     two_source_items: frozenset[str] = frozenset()
@@ -77,16 +80,23 @@ class ScopeDriver:
     def prepare_waveform(self, scope: pyvisa.resources.Resource) -> None:
         """Any setup needed before ``:WAV:PRE?``/``:WAV:DATA?`` (default: nothing)."""
 
-    def read_waveform_data(self, scope: pyvisa.resources.Resource) -> str:
-        """Read ``:WAV:DATA?`` and return the CSV payload as a string (header stripped).
+    def read_waveform_data(self, scope: pyvisa.resources.Resource) -> str | bytes:
+        """Read ``:WAV:DATA?`` and return its payload (header stripped).
 
         Implementations differ per family: DS1000Z wraps the ASCII payload in an IEEE
         488.2 definite-length block (``#N<len><csv>``) which must be read with the
         backend-aware exact-byte-count reader to avoid hanging USBTMC bulk-IN on
         pyvisa-py/WinUSB; DHO sends bare CSV with no header and can be read to the
-        newline terminator (safe because ASCII payloads never contain 0x0A).
+        newline terminator (safe because ASCII payloads never contain 0x0A). DS1000Z-E
+        uses BYTE blocks and returns bytes, avoiding assumptions about ASCII framing.
         """
         raise NotImplementedError
+
+    def decode_waveform_data(self, payload: str | bytes, preamble: list[str]) -> list[float]:
+        """Decode actual-voltage ASCII samples; binary drivers override scaling."""
+        if not isinstance(payload, str):
+            raise ValueError(f"Expected ASCII waveform data for {self.name}")
+        return [float(value) for value in payload.split(",") if value.strip()]
 
     # --- cursors ---
     def write_cursor_axis(self, scope: pyvisa.resources.Resource,
@@ -164,6 +174,58 @@ class DS1000ZDriver(ScopeDriver):
         scope.write(f":MEASure:ITEM {','.join((item, *sources))}")
 
 
+class DS1000ZEDriver(DS1000ZDriver):
+    """DS1202Z-E / DS1102Z-E: documented BYTE NORM transfer and voltage scaling."""
+
+    name = "DS1000Z-E"
+    waveform_format = "BYTE"
+
+    @classmethod
+    def matches(cls, idn: str) -> bool:
+        fields = idn.split(",")
+        return len(fields) >= 2 and fields[1].strip().upper() in {"DS1202Z-E", "DS1102Z-E"}
+
+    def prepare_waveform(self, scope: pyvisa.resources.Resource) -> None:
+        # Explicitly select the full screen range, including after external window changes.
+        scope.write(":WAV:STAR 1")
+        scope.write(":WAV:STOP 1200")
+
+    def read_waveform_data(self, scope: pyvisa.resources.Resource) -> bytes:
+        from rigol_mcp.scope import _read_definite_block
+        scope.write(":WAV:DATA?")
+        # Disable termchar matching for the whole block, including embedded LF samples.
+        saved_read_termination = scope.read_termination
+        scope.read_termination = None
+        try:
+            return _read_definite_block(scope)
+        finally:
+            scope.read_termination = saved_read_termination
+
+    def decode_waveform_data(self, payload: str | bytes, preamble: list[str]) -> list[float]:
+        if not isinstance(payload, bytes):
+            raise ValueError("Expected BYTE waveform data for DS1000Z-E")
+        if len(preamble) != 10:
+            raise ValueError("DS1000Z-E waveform preamble must contain 10 fields")
+        try:
+            fmt, mode, points, count = map(int, preamble[:4])
+            xinc, xorigin, xref, yinc, yorigin, yref = map(float, preamble[4:])
+        except ValueError as error:
+            raise ValueError("Invalid numeric field in DS1000Z-E waveform preamble") from error
+        if fmt != 0 or mode != 0:
+            raise ValueError("Expected BYTE/NORM waveform preamble for DS1000Z-E")
+        if not all(math.isfinite(value) for value in (xinc, xorigin, xref, yinc, yorigin, yref)):
+            raise ValueError("Non-finite calibration in DS1000Z-E waveform preamble")
+        if xinc <= 0 or yinc <= 0 or count < 1:
+            raise ValueError("Invalid increment or count in DS1000Z-E waveform preamble")
+        if not 1 <= points <= 1200 or len(payload) != points:
+            raise ValueError(
+                f"DS1000Z-E waveform point mismatch: preamble={points}, payload={len(payload)}"
+            )
+        # BYTE samples are integers in 0..255, so subtraction cannot wrap at uint8.
+        # Preamble scaling already incorporates the configured probe ratio.
+        return [(sample - yorigin - yref) * yinc for sample in payload]
+
+
 class DHODriver(ScopeDriver):
     """Rigol DHO series (12-bit)."""
 
@@ -226,8 +288,9 @@ class DHODriver(ScopeDriver):
 # Registry: checked in order, first match wins. An identity matched by no driver is an
 # error (see driver_for) — we do not guess a dialect for an unknown instrument.
 DS1000Z = DS1000ZDriver()
+DS1000ZE = DS1000ZEDriver()
 DHO = DHODriver()
-_DRIVERS: tuple[ScopeDriver, ...] = (DHO, DS1000Z)
+_DRIVERS: tuple[ScopeDriver, ...] = (DHO, DS1000ZE, DS1000Z)
 
 # Union of every family's two-source items — used to reject two-source items passed to the
 # single-source measure(), and to advertise the full enum in the tool schema.

@@ -88,7 +88,12 @@ def get_lan_resource_string() -> str:
     ip = os.environ.get("RIGOL_IP")
     if not ip:
         raise RuntimeError("RIGOL_IP environment variable is not set")
-    return f"TCPIP0::{ip}::5555::SOCKET"
+    protocol = os.environ.get("RIGOL_LAN_PROTOCOL", "socket").strip().lower()
+    if protocol == "socket":
+        return f"TCPIP0::{ip}::5555::SOCKET"
+    if protocol == "vxi11":
+        return f"TCPIP0::{ip}::INSTR"
+    raise ValueError("RIGOL_LAN_PROTOCOL must be 'socket' or 'vxi11'")
 
 
 def find_usb_resource_string(rm: pyvisa.ResourceManager) -> str:
@@ -309,13 +314,47 @@ def check_scpi_error(scope: pyvisa.resources.Resource) -> str | None:
     """
     first_err: str | None = None
     for _ in range(16):
-        response = scope.query(":SYSTem:ERRor?").strip()
+        response = _query_scpi_error(scope)
         # No error returns '0' or '0,"No error"'
         if response == "0" or response.startswith("0,"):
             return first_err
         if first_err is None:
             first_err = response
     return first_err
+
+
+def _query_scpi_error(scope: pyvisa.resources.Resource) -> str:
+    """Read one error-queue entry over a transport safe for the detected model.
+
+    DS1000Z-E port 5555 stops answering ``:SYSTem:ERRor?`` after some measurement and
+    binary-transfer sequences even though ordinary queries on that same session continue
+    to work.  Its documented VXI-11 service remains responsive, so use that independent
+    LAN control channel for error-queue reads while keeping all other traffic on the
+    requested raw socket.  USB, VXI-11, and other model families use their active session.
+    """
+    resource_name = str(getattr(scope, "resource_name", "")).upper()
+    if resource_name.endswith("::SOCKET") and get_driver(scope).name == "DS1000Z-E":
+        ip = os.environ.get("RIGOL_IP", "").strip()
+        if not ip:
+            raise RuntimeError("RIGOL_IP is required for DS1000Z-E error-queue fallback")
+        rm = pyvisa.ResourceManager("@py")
+        error_scope = None
+        try:
+            error_scope = rm.open_resource(f"TCPIP0::{ip}::INSTR", open_timeout=5000)
+            error_scope.timeout = 5000
+            error_scope.write_termination = "\n"
+            error_scope.read_termination = "\n"
+            return error_scope.query(":SYSTem:ERRor?").strip()
+        finally:
+            if error_scope is not None:
+                try:
+                    error_scope.close()
+                except Exception:
+                    pass
+            # ResourceManager("@py") is cached by PyVISA. Closing it here would
+            # also close the primary raw-socket session. Only the temporary resource
+            # belongs to this operation; the manager lives for the server lifetime.
+    return scope.query(":SYSTem:ERRor?").strip()
 
 
 def get_cursor_mode(scope: pyvisa.resources.Resource) -> str:
@@ -444,6 +483,7 @@ def connection_info() -> dict:
     """
     rigol_usb    = os.environ.get("RIGOL_USB", "").strip()
     rigol_ip     = os.environ.get("RIGOL_IP", "").strip()
+    lan_protocol = os.environ.get("RIGOL_LAN_PROTOCOL", "socket").strip().lower()
     rigol_serial = os.environ.get("RIGOL_USB_SERIAL", "").strip()
     info: dict = {
         "transport": "USB" if usb_in_use() else "LAN",
@@ -454,8 +494,13 @@ def connection_info() -> dict:
         info["RIGOL_USB_SERIAL"] = rigol_serial or "(unset → any Rigol scope)"
         info["backend_hint"]     = _usb_backend_hint or "(none yet — will auto-detect)"
     else:
-        info["lan_target"] = (f"TCPIP0::{rigol_ip}::5555::SOCKET"
-                              if rigol_ip else "(RIGOL_IP not set)")
+        info["RIGOL_LAN_PROTOCOL"] = lan_protocol or "socket"
+        if not rigol_ip:
+            info["lan_target"] = "(RIGOL_IP not set)"
+        elif lan_protocol == "vxi11":
+            info["lan_target"] = f"TCPIP0::{rigol_ip}::INSTR"
+        else:
+            info["lan_target"] = f"TCPIP0::{rigol_ip}::5555::SOCKET"
     if _scope is not None:
         info["session"]  = "cached/open"
         info["resource"] = getattr(_scope, "resource_name", "?")
@@ -712,28 +757,31 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
         warnings.append(note)
     scope.write(f":WAV:SOUR {ch}")
     scope.write(":WAV:MODE NORM")
-    scope.write(":WAV:FORM ASC")
-    get_driver(scope).prepare_waveform(scope)
+    driver = get_driver(scope)
+    scope.write(f":WAV:FORM {driver.waveform_format}")
+    driver.prepare_waveform(scope)
 
     pre_str = scope.query(":WAV:PRE?").strip()
     pre = pre_str.split(",")
-    x_inc   = float(pre[4])
-    x_origin = float(pre[5])
-    x_ref   = float(pre[6])
 
-    # Read the ASCII waveform payload. The framing differs by family (DS1000Z wraps the CSV
-    # in an IEEE 488.2 definite-length block, DHO sends bare CSV) so the read strategy is
-    # delegated to the driver — see ScopeDriver.read_waveform_data.
-    data_str = get_driver(scope).read_waveform_data(scope)
-    voltages = [float(v) for v in data_str.split(",") if v.strip()]
+    # Driver selects both the framing and sample format: legacy families use voltage CSV,
+    # DS1000Z-E returns calibrated BYTE samples. Do not treat binary LF as a terminator.
+    payload = driver.read_waveform_data(scope)
+
+    def has_samples(data: str | bytes) -> bool:
+        if isinstance(data, bytes):
+            return bool(data)
+        return any(value.strip() for value in data.split(","))
+
     # A just-enabled channel serves an empty payload until a full sweep lands (~2 s after
     # DISP ON at 50 ms/div on a DS1104Z), so poll briefly before giving up.
     deadline = time.monotonic() + _WAVEFORM_DATA_RETRY_S
-    while not voltages and time.monotonic() < deadline:
+    polled = False
+    while not has_samples(payload) and time.monotonic() < deadline:
         time.sleep(1.0)
-        data_str = get_driver(scope).read_waveform_data(scope)
-        voltages = [float(v) for v in data_str.split(",") if v.strip()]
-    if not voltages:
+        payload = driver.read_waveform_data(scope)
+        polled = True
+    if not has_samples(payload):
         reason = (
             f"{ch} returned no waveform data — the channel has not acquired anything yet. "
             "Ensure acquisition is running (run tool, or single/autoscale) and re-capture."
@@ -741,13 +789,15 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
         if warnings:
             reason += f" Note: {warnings[0]}"
         raise RuntimeError(reason)
-    if x_inc == 0:
+    if polled or (len(pre) > 4 and float(pre[4]) == 0):
         # The preamble was read before the first sweep on a just-enabled channel completed —
         # the scope reports 0 s/point until then. Refresh it now that data exists.
         pre = scope.query(":WAV:PRE?").strip().split(",")
-        x_inc    = float(pre[4])
-        x_origin = float(pre[5])
-        x_ref    = float(pre[6])
+    # Decode after refreshing: initial zero increments can include stale Y calibration too.
+    voltages = driver.decode_waveform_data(payload, pre)
+    x_inc    = float(pre[4])
+    x_origin = float(pre[5])
+    x_ref    = float(pre[6])
     n = len(voltages)
     times = [x_origin + (i - x_ref) * x_inc for i in range(n)]
 
@@ -847,10 +897,37 @@ def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
         raise ValueError(f"Expected TMC block header starting with '#', got {prefix!r}")
     n = int(prefix[1:2])
     data_length = int(scope.read_bytes(n))
-    raw = scope.read_bytes(data_length + 1)  # +1 for the trailing newline
-    if raw[-1:] != b'\n':
-        raise ValueError(f"Expected \\n after definite-length block, got {raw[-1:]!r}")
-    return raw[:-1]
+    data = scope.read_bytes(data_length)
+    if len(data) != data_length:
+        raise ValueError(
+            f"Truncated block: header declared {data_length} payload bytes, "
+            f"received {len(data)} bytes"
+        )
+    _consume_optional_block_terminator(scope)
+    return data
+
+
+def _consume_optional_block_terminator(scope: pyvisa.resources.Resource) -> None:
+    """Consume a trailing LF when the instrument sends one, without requiring it.
+
+    The block header determines the payload size. A sender without a trailing LF
+    must not make a complete payload wait for the full session timeout. When LF is
+    present, consume it before the next query. Probe only after receiving the complete
+    header-declared payload; a missing or truncated payload still raises an error.
+    """
+    saved_timeout = scope.timeout
+    try:
+        scope.timeout = 100
+        try:
+            terminator = scope.read_bytes(1)
+        except pyvisa.errors.VisaIOError as error:
+            if error.error_code == pyvisa.constants.StatusCode.error_timeout:
+                return
+            raise
+    finally:
+        scope.timeout = saved_timeout
+    if terminator not in (b"", b"\n"):
+        raise ValueError(f"Unexpected byte after definite-length block: {terminator!r}")
 
 
 def screenshot_png(scope: pyvisa.resources.Resource) -> bytes:

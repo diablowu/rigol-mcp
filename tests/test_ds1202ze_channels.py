@@ -21,8 +21,8 @@ class ModelScope(FakeScope):
             ":TRIGger:MODE?": "EDGE", ":TRIGger:STATus?": "STOP",
             ":TRIGger:EDGE:SOURce?": "CHAN1", ":TRIGger:EDGE:SLOPe?": "POS",
             ":TRIGger:EDGE:LEVel?": "0.5", ":AUToscale;*OPC?": "1",
-            ":MEASure:ITEM?": "1.0", ":WAV:PRE?": "2,0,3,1,1e-6,0,0,1,0,0",
-        }, read_buffer=make_block(b"0,1,0"))
+            ":MEASure:ITEM?": "1.0", ":WAV:PRE?": "0,0,3,1,1e-6,0,0,1,0,0",
+        }, read_buffer=make_block(bytes([0, 1, 0])))
         self.timeout = 30000
         for i in range(1, channels + 1):
             for key, value in {"DISP": "1", "SCAL": "1", "OFFS": "0",
